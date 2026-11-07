@@ -8,7 +8,7 @@ use hbb_common::{
     futures::future::join_all,
     futures_util::{
         sink::SinkExt,
-        stream::{SplitSink, StreamExt},
+        stream::{SplitSink, SplitStream, StreamExt},
     },
     log,
     protobuf::{Message as _, MessageField},
@@ -16,7 +16,8 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    sodiumoxide::crypto::box_,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -52,6 +53,7 @@ type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
     TcpStream(TcpStreamSink),
+    SecureTcp(TcpStreamSink, Encrypt),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -605,8 +607,17 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    let keep_for_ice = !rr.webrtc_sdp_answer.is_empty();
                     msg_out.set_relay_response(rr);
-                    allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    if keep_for_ice {
+                        self.send_to_tcp_keep(msg_out, addr_b).await;
+                    } else {
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    }
+                }
+                Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                    self.handle_ice_candidate(ice, addr).await;
+                    return true;
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
@@ -704,10 +715,12 @@ impl RendezvousServer {
             &addr
         );
         let mut msg_out = RendezvousMessage::new();
+        let keep_for_ice = !phs.webrtc_sdp_answer.is_empty();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            webrtc_sdp_answer: phs.webrtc_sdp_answer,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -716,6 +729,8 @@ impl RendezvousServer {
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
             socket.send(&msg_out, addr_a).await?;
+        } else if keep_for_ice {
+            self.send_to_tcp_keep(msg_out, addr_a).await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -843,6 +858,7 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     ..Default::default()
                 });
             }
@@ -902,11 +918,55 @@ impl RendezvousServer {
                     Sink::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
+                    Sink::SecureTcp(s, enc) => {
+                        allow_err!(s.send(Bytes::from(enc.enc(&bytes))).await);
+                    }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
                 }
             }
+        }
+    }
+
+    // Keeps the connection registered, so the WebRTC ICE candidates that follow an SDP answer can
+    // still reach it.
+    async fn send_to_tcp_keep(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
+        let addr = try_into_v4(addr);
+        let mut tcp_punch = self.tcp_punch.lock().await;
+        let mut sink = tcp_punch.remove(&addr);
+        Self::send_to_sink(&mut sink, msg).await;
+        if let Some(sink) = sink {
+            tcp_punch.insert(addr, sink);
+        }
+    }
+
+    // Trickled WebRTC ICE candidates. From the controlling side (`id` set) they go to the
+    // controlled peer, only on a connection that asked for a punch hole; from the controlled side
+    // (`socket_addr` set) they go back to the controlling side's connection.
+    async fn handle_ice_candidate(&mut self, mut ice: IceCandidate, addr: SocketAddr) {
+        let mut msg_out = RendezvousMessage::new();
+        if !ice.id.is_empty() {
+            if !self
+                .tcp_punch
+                .lock()
+                .await
+                .contains_key(&try_into_v4(addr))
+            {
+                return;
+            }
+            let Some(peer) = self.pm.get_in_memory(&ice.id).await else {
+                return;
+            };
+            let peer_addr = peer.read().await.socket_addr;
+            ice.socket_addr = AddrMangle::encode(addr).into();
+            msg_out.set_ice_candidate(ice);
+            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+        } else if !ice.socket_addr.is_empty() {
+            let addr_a = AddrMangle::decode(&ice.socket_addr);
+            ice.socket_addr = Default::default();
+            msg_out.set_ice_candidate(ice);
+            self.send_to_tcp_keep(msg_out, addr_a).await;
         }
     }
 
@@ -1262,9 +1322,29 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut dec = None;
+            if let Some(sk) = self.inner.sk.clone() {
+                let (enc, first) = Self::key_exchange(&mut a, &mut b, &sk).await?;
+                dec = enc.clone();
+                sink = Some(match enc {
+                    Some(enc) => Sink::SecureTcp(a, enc),
+                    None => Sink::TcpStream(a),
+                });
+                if let Some(bytes) = first {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        return Ok(());
+                    }
+                }
+            } else {
+                sink = Some(Sink::TcpStream(a));
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(dec) = dec.as_mut() {
+                    if dec.dec(&mut bytes).is_err() {
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1277,6 +1357,37 @@ impl RendezvousServer {
         Ok(())
     }
 
+    // The server side of the clients' `secure_tcp`, at the original key exchange version: sign an
+    // ephemeral key, then open the symmetric key the client sealed to it. A client that sends
+    // anything else first predates the exchange; that first message is returned to be handled in
+    // the clear.
+    async fn key_exchange(
+        a: &mut TcpStreamSink,
+        b: &mut SplitStream<Framed<TcpStream, BytesCodec>>,
+        sk: &sign::SecretKey,
+    ) -> ResultType<(Option<Encrypt>, Option<BytesMut>)> {
+        let (our_pk, our_sk) = box_::gen_keypair();
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![sign::sign(&our_pk.0, sk).into()],
+            ..Default::default()
+        });
+        a.send(Bytes::from(msg_out.write_to_bytes()?)).await?;
+        let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await else {
+            bail!("no message after key exchange");
+        };
+        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+            if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                if ex.keys.len() != 2 {
+                    bail!("invalid key exchange message");
+                }
+                let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk)?;
+                return Ok((Some(Encrypt::new(key)), None));
+            }
+        }
+        Ok((None, Some(bytes)))
+    }
+
     #[inline]
     async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
         if version.is_empty() || self.inner.sk.is_none() {
@@ -1286,7 +1397,7 @@ impl RendezvousServer {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
-                        &hbb_common::message_proto::IdPk {
+                        &IdPk {
                             id,
                             pk,
                             ..Default::default()
